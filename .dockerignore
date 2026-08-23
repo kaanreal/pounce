@@ -1,0 +1,8 @@
+.venv/
+data/
+__pycache__/
+*.pyc
+.git/
+Dockerfile
+compose.yml
+README.md
