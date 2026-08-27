@@ -72,7 +72,7 @@ async def claim_name(session, token, name):
     429 = rate limited. 5xx = their servers struggling (common on big drops)."""
     url = f"{MCSERVICES}/minecraft/profile/name/{quote(name)}"
     try:
-        async with session.put(url, headers=_headers(token)) as r:
+        async with session.put(url, headers=_headers(token), json={}) as r:
             body = await r.text()
             try:
                 body_json = json.loads(body)
