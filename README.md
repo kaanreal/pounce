@@ -8,10 +8,9 @@ It is built to run unattended on something small. Mine lives on a Raspberry Pi n
 
 ## How it works
 
-- a watcher cycles the watchlist through Mojang's availability check at a fixed polite pace, well under the ~600 requests per 10 minutes they allow
-- when a watched name loses its owner, its future drop window is computed and stored
-- for armed names, a hunter polls the window and fires claims around the drop second
-- with a known drop time, it syncs its clock against Mojang's `Date` headers and sends a short timed burst instead
+- a watcher sweeps the whole watchlist through Mojang's batch lookup endpoint, so the full fleet (every three letter name included) is re-checked roughly every 45 minutes from a single IP, politely under their request budget
+- the moment a name stops resolving, it has dropped. pounce records it, floods claims at it immediately, and keeps re-firing for a few minutes while it stays free
+- with a known exact drop time, it syncs its clock against Mojang's `Date` headers and sends a short timed burst instead
 - after any win, claiming pauses itself until you run `resume`, so one lucky catch never turns into a rename loop
 
 Everything it learns lives in `data/`: a small SQLite database, your tokens, and an event log. Nothing leaves your machine except Mojang API calls.

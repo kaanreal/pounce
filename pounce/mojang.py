@@ -66,6 +66,24 @@ async def get_profile(session, token):
         return r.status, await r.json(content_type=None)
 
 
+async def batch_lookup(session, limiter, names):
+    """check up to 10 names at once: returns set of existing (taken) names,
+    or None on 429/network error (caller should retry without consuming state)."""
+    await limiter.acquire()
+    try:
+        async with session.post(f"{API_MOJANG}/profiles/minecraft", json=list(names)) as r:
+            if r.status == 429:
+                log().warning("batch sweep rate limited, backing off")
+                return None
+            if r.status != 200:
+                log().warning("batch sweep http %d: %s", r.status, (await r.text())[:120])
+                return None
+            return {p["name"].lower() for p in await r.json(content_type=None)}
+    except aiohttp.ClientError as e:
+        log().warning("batch sweep network error (%s)", e)
+        return None
+
+
 async def claim_name(session, token, name):
     """the actual snipe: PUT the new name on our account.
     200 = won. 403 = taken / cooldown / we changed names <30 days ago.

@@ -36,6 +36,10 @@ DEFAULT_CONFIG = {
     "check_spacing_s": 1.2,
     "limiter_max": 550,
     "limiter_window_s": 600,
+    # batch sweep: names checked per request (max 10), full fleet pass ~45 min
+    "batch_slice": 10,
+    # after a drop, keep re-firing at these intervals while the name stays free
+    "flip_retry_delays": [10, 30, 90, 300],
     # flip hunting (polling a name around its drop window)
     "hunt_pre_margin_s": 120,
     "hunt_post_margin_s": 600,

@@ -8,9 +8,7 @@ import aiohttp
 
 from .auth import get_mc_token
 from .common import (
-    DROP_DELAY_S,
     cyan,
-    fmt_duration,
     fmt_ts,
     green,
     log,
@@ -18,15 +16,14 @@ from .common import (
     yellow,
 )
 from .hunter import hunt
-from .mojang import RateLimiter, check_name, claim_name
+from .mojang import RateLimiter, batch_lookup, check_name, claim_name
 from .store import (
     event,
     kv_get,
     kv_set,
-    mark_checked,
-    next_due_target,
+    due_targets,
+    mark_batch,
     pending_hunts,
-    set_cooldown,
     set_state,
     upcoming_timed,
 )
@@ -93,53 +90,78 @@ class Watcher:
         log().warning("claim of %s failed: http %s %s", name, status, body)
         return False
 
-    def handle_check(self, target, res):
-        name = target["name"]
-        prev_owner = target.get("owner_uuid")
-
-        if res["status"] == "taken":
-            new_owner = res["uuid"]
-            if prev_owner and new_owner and new_owner != prev_owner:
-                # owner changed away from this name: it will drop exactly
-                # DROP_DELAY after they changed. we know it happened between
-                # the previous check and now.
-                lo = (target.get("last_checked") or time.time()) + DROP_DELAY_S
-                hi = time.time() + DROP_DELAY_S
-                set_cooldown(name, lo, hi)
-                event("OWNER_CHANGE", name, f"{prev_owner} -> {new_owner}, drops {fmt_ts(lo)}..{fmt_ts(hi)}")
-                log().info(
-                    "%s changed owner! drops between %s and %s",
-                    cyan(name), fmt_ts(lo), fmt_ts(hi),
-                )
-                return
-            if not prev_owner:
-                log().debug("%s taken by %s (baseline)", name, new_owner)
-            mark_checked(name, new_owner)
-
-        elif res["status"] == "free":
-            if prev_owner or target.get("state") == "cooldown":
-                # it was ours-watched and now nobody has it: it JUST dropped
-                log().info("%s just went FREE (was held until now)", green(name))
-                event("FLIP_FREE", name)
-                hunt_task = self.hunt_tasks.pop(name, None)
-                if hunt_task and not hunt_task.done():
-                    hunt_task.cancel()
-                asyncio.ensure_future(self._flip_flow(target))
-            else:
-                log().debug("%s already free (no prior owner recorded)", name)
-                set_state(name, "missed")
-
-        elif res["status"] == "ratelimited":
-            log().warning("rate limited by mojang, slowing down")
-
-        else:
-            log().debug("%s check error: %s", name, res)
-            mark_checked(name, prev_owner)
-
     async def _flip_flow(self, target):
-        claimed = await self.try_claim_flip(target)
-        if not claimed:
-            set_state(target["name"], "missed")
+        """a watched name just went free. claim it, and if the first try
+        hits a transient error keep re-firing while it stays free.
+        burst now, then a retry ladder, then give up."""
+        name = target["name"]
+        if not self.may_claim(target):
+            return
+
+        async def one_shot():
+            tok = await self.token()
+            status, body = await claim_name(self.session, tok, name)
+            if status == 200:
+                set_state(name, "claimed")
+                event("CLAIM_SUCCESS", name, "drop burst")
+                log().info(green(f">>> {name} IS YOURS <<<"))
+                if self.cfg.get("pause_after_claim"):
+                    kv_set("auto_claim_paused", "1")
+                    log().warning("auto claiming paused after the win"
+                                  " (`resume` to re-enable)")
+            else:
+                event("CLAIM_FAIL", name, f"{status} {body}")
+                log().warning("claim of %s failed: http %s %s", name, status, body)
+            return status
+
+        if await one_shot() == 200:
+            return
+        # transient failures (429 / 5xx / net): keep trying while it stays free
+        for delay in self.cfg.get("flip_retry_delays", [10, 30, 90, 300]):
+            await asyncio.sleep(delay)
+            if self.paused():
+                break
+            res = await check_name(self.session, name, self.limiter)
+            if res["status"] == "free":
+                if await one_shot() == 200:
+                    return
+            else:
+                event("TAKEN_AGAIN", name, "someone grabbed it while we retried")
+                log().info("%s got taken while we retried, moving on", yellow(name))
+                return
+        set_state(name, "missed")
+
+    def handle_batch(self, targets, present, ts):
+        """one sweep slice. flags list of (target) that just dropped."""
+        dropped = []
+        for t in targets:
+            name = t["name"]
+            was_present = bool(t.get("present")) or bool(t.get("owner_uuid"))
+            is_present = name.lower() in present
+            if was_present and not is_present:
+                lo = t.get("last_present") or t.get("last_checked") or ts
+                event("FLIP_FREE", name, f"freeing since ~{fmt_ts(lo)}")
+                log().info("%s just went FREE (since %s)!", cyan(name), fmt_ts(lo))
+                dropped.append(t)
+            elif not was_present and is_present:
+                event("TAKEN", name)
+                log().info("%s got taken", yellow(name))
+            mark_batch(name, is_present, t.get("owner_uuid") if is_present else "", ts)
+        return dropped
+
+    def _handle_dropped(self, target):
+        name = target["name"]
+        if self.paused():
+            event("ALERT", name, "flipped free but auto claim is paused")
+            log().warning("%s flipped FREE but claiming is paused! claim manually now",
+                          red(name))
+            return
+        if not self.may_claim(target):
+            event("ALERT", name, "flipped free, priority too low to auto claim")
+            log().warning("%s flipped FREE (priority %d, auto claim off for it)",
+                          yellow(name), target.get("priority", 0))
+            return
+        asyncio.ensure_future(self._flip_flow(target))
 
     def schedule_timed(self):
         horizon = 6 * 3600
@@ -207,19 +229,26 @@ class Watcher:
                         await asyncio.sleep(2)
                         continue
 
-                    target = next_due_target()
-                    if target is None:
+                    slice_ = due_targets(self.cfg.get("batch_slice", 10))
+                    if not slice_:
                         await asyncio.sleep(5)
                         continue
 
-                    res = await check_name(session, target["name"], self.limiter)
-                    if res["status"] != "ratelimited":
-                        self.handle_check(target, res)
-                        self._checks += 1
-                        if self._checks % 250 == 0:
-                            rate = self._checks / (time.time() - self._started)
-                            log().info("progress: %d checks (%.2f/s)", self._checks, rate)
-                    await asyncio.sleep(max(cfg["check_spacing_s"], 0.5))
+                    present = await batch_lookup(
+                        session, self.limiter, [t["name"] for t in slice_])
+                    if present is None:
+                        await asyncio.sleep(min(max(cfg["check_spacing_s"], 0.5), 5))
+                        continue
+
+                    ts = time.time()
+                    for t in self.handle_batch(slice_, present, ts):
+                        self._handle_dropped(t)
+                    self._checks += len(slice_)
+                    if self._checks % 2000 == 0:
+                        rate = self._checks / (time.time() - self._started)
+                        log().info("progress: %d names sampled (%.0f/min)",
+                                   self._checks, rate * 60)
+                    await asyncio.sleep(max(cfg["check_spacing_s"], 0.8))
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:

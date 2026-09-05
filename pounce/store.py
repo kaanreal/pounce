@@ -19,7 +19,10 @@ CREATE TABLE IF NOT EXISTS targets(
   drop_lo REAL,
   drop_hi REAL,
   droptime REAL,
-  note TEXT
+  note TEXT,
+  present INTEGER DEFAULT 0,
+  last_seen REAL,
+  last_present REAL
 );
 CREATE TABLE IF NOT EXISTS events(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -33,6 +36,23 @@ CREATE TABLE IF NOT EXISTS kv(
   value TEXT
 );
 """
+
+
+def _migrate(c):
+    """add new columns to tables created by older schema versions"""
+    cols = {r["name"] for r in c.execute("PRAGMA table_info(targets)")}
+    for name, ddl in {
+        "present": "ALTER TABLE targets ADD COLUMN present INTEGER DEFAULT 0",
+        "last_seen": "ALTER TABLE targets ADD COLUMN last_seen REAL",
+        "last_present": "ALTER TABLE targets ADD COLUMN last_present REAL",
+    }.items():
+        if name not in cols:
+            c.execute(ddl)
+    # existing rows with a known owner count as currently present
+    c.execute(
+        "UPDATE targets SET present=1 WHERE present=0 "
+        "AND owner_uuid IS NOT NULL AND owner_uuid != ''"
+    )
 
 
 @contextmanager
@@ -52,6 +72,7 @@ def conn():
 def init_db():
     with conn() as c:
         c.executescript(SCHEMA)
+        _migrate(c)
 
 
 def upsert_target(name, priority=None, source=None, droptime=None, note=None):
@@ -143,6 +164,30 @@ def set_cooldown(name, lo, hi):
             "UPDATE targets SET state='cooldown', last_checked=?, last_change_at=?, drop_lo=?, drop_hi=? WHERE name=?",
             (now(), now(), lo, hi, name),
         )
+
+
+def mark_batch(name, present, owner_uuid, ts):
+    """batch sweep bookkeeping: presence flag + last sample timestamps.
+    present=0 clears owner_uuid so a future re-free is not double-fired."""
+    with conn() as c:
+        c.execute(
+            "UPDATE targets SET present=?, last_seen=?, "
+            "last_present=CASE WHEN ?=1 THEN ? ELSE last_present END, "
+            "owner_uuid=?, state='watching', last_checked=? WHERE name=?",
+            (1 if present else 0, ts, 1 if present else 0,
+             ts if present else 0, owner_uuid, ts, name),
+        )
+
+
+def due_targets(n):
+    """oldest-checked watching targets, never-checked ones first, up to n"""
+    with conn() as c:
+        rows = c.execute(
+            "SELECT * FROM targets WHERE state IN ('watching','missed') "
+            "ORDER BY (last_checked IS NULL) DESC, priority DESC, last_checked ASC LIMIT ?",
+            (n,),
+        ).fetchall()
+        return [dict(r) for r in rows]
 
 
 def set_state(name, state):
