@@ -6,6 +6,7 @@ services:
     container_name: pounce
     restart: unless-stopped
     user: "1000:1000"
+    network_mode: host
     volumes:
       - ./data:/app/data
       - /etc/localtime:/etc/localtime:ro
