@@ -17,11 +17,13 @@ from .common import (
 )
 from .hunter import hunt
 from .mojang import RateLimiter, batch_lookup, check_name, claim_name
+from .notify import fire
 from .store import (
     event,
     kv_get,
     kv_set,
     due_targets,
+    list_targets,
     mark_batch,
     pending_hunts,
     set_state,
@@ -82,12 +84,17 @@ class Watcher:
             set_state(name, "claimed")
             event("CLAIM_SUCCESS", name, "cycle flip")
             log().info(green(f">>> {name} IS YOURS <<<"))
+            fire(self.session, self.cfg, f"{name} is yours!",
+                 "first live win under the batch engine", tags=["tada", "partying_face"])
             if self.cfg.get("pause_after_claim"):
                 kv_set("auto_claim_paused", "1")
                 log().warning("auto claiming paused after the win (`resume` to re-enable)")
             return True
         event("CLAIM_FAIL", name, f"{status} {body}")
         log().warning("claim of %s failed: http %s %s", name, status, body)
+        if status not in (-1, 429, 500, 501, 502, 503, 504):
+            fire(self.session, self.cfg, f"lost {name}",
+                 f"claim rejected: http {status}", tags=["cry"])
         return False
 
     async def _flip_flow(self, target):
@@ -105,6 +112,8 @@ class Watcher:
                 set_state(name, "claimed")
                 event("CLAIM_SUCCESS", name, "drop burst")
                 log().info(green(f">>> {name} IS YOURS <<<"))
+                fire(self.session, self.cfg, f"{name} is yours!",
+                     "drop burst won", tags=["tada", "partying_face"])
                 if self.cfg.get("pause_after_claim"):
                     kv_set("auto_claim_paused", "1")
                     log().warning("auto claiming paused after the win"
@@ -112,6 +121,9 @@ class Watcher:
             else:
                 event("CLAIM_FAIL", name, f"{status} {body}")
                 log().warning("claim of %s failed: http %s %s", name, status, body)
+                if status not in (-1, 429, 500, 501, 502, 503, 504):
+                    fire(self.session, self.cfg, f"lost {name}",
+                         f"claim rejected: http {status}", tags=["cry"])
             return status
 
         if await one_shot() == 200:
@@ -142,6 +154,8 @@ class Watcher:
                 lo = t.get("last_present") or t.get("last_checked") or ts
                 event("FLIP_FREE", name, f"freeing since ~{fmt_ts(lo)}")
                 log().info("%s just went FREE (since %s)!", cyan(name), fmt_ts(lo))
+                fire(self.session, self.cfg, f"{name} went free!",
+                     f"dropped since ~{fmt_ts(lo)}, pounce is on it", tags=["tada"])
                 dropped.append(t)
             elif not was_present and is_present:
                 event("TAKEN", name)
@@ -155,11 +169,15 @@ class Watcher:
             event("ALERT", name, "flipped free but auto claim is paused")
             log().warning("%s flipped FREE but claiming is paused! claim manually now",
                           red(name))
+            fire(self.session, self.cfg, f"{name} is free",
+                 "claiming is paused, grab it manually", tags=["warning"])
             return
         if not self.may_claim(target):
             event("ALERT", name, "flipped free, priority too low to auto claim")
             log().warning("%s flipped FREE (priority %d, auto claim off for it)",
                           yellow(name), target.get("priority", 0))
+            fire(self.session, self.cfg, f"{name} is free",
+                 "priority too low to auto claim", tags=["warning"])
             return
         asyncio.ensure_future(self._flip_flow(target))
 
@@ -216,6 +234,10 @@ class Watcher:
         async with aiohttp.ClientSession(connector=connector) as session:
             self.session = session
             log().info("watcher running. ctrl+c to stop")
+            armed = sum(1 for r in list_targets() if r.get("priority", 0) >= 1)
+            fire(self.session, self.cfg, "pounce is online",
+                 f"watching {armed} armed names, sweeping until something drops",
+                 tags=["zap"])
             while True:
                 try:
                     self.schedule_timed()

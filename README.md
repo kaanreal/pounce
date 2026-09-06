@@ -37,6 +37,14 @@ Names are watched passively by default. To arm a name for auto claiming:
 .venv/bin/python -m pounce prioritize moon
 ```
 
+It can reach you when something happens. Optional `ntfy` block in `data/config.json`:
+
+```json
+"ntfy": { "topic": "your-secret-topic" }
+```
+
+It pushes when a name drops, when one is won or lost, and once when it comes online. Pick a topic nobody can guess, that is the only thing standing between a random stranger and your drip feed of dropped name alerts. Self-hosted ntfy works too via `"url": "https://ntfy.example.com"`.
+
 ## Docker
 
 ```sh
