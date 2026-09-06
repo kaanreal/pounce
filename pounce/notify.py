@@ -19,21 +19,22 @@ def enabled(cfg):
     return bool(_conf(cfg).get("topic"))
 
 
-def _target(cfg):
-    block = _conf(cfg)
-    url = str(block.get("url", DEFAULT_NTFY_URL)).rstrip("/")
-    return f"{url}/{block['topic']}"
+def _base(cfg):
+    url = str(_conf(cfg).get("url", DEFAULT_NTFY_URL)).rstrip("/")
+    return f"{url}/"
 
 
 async def send(session, cfg, title, message, tags=None):
     if not enabled(cfg):
         return
+    # post to the base url with the topic inside the body. posting json to
+    # /{topic} makes ntfy republish the raw blob as the message, json stays single.
     payload = {"topic": _conf(cfg)["topic"], "title": title, "message": message}
     if tags:
         payload["tags"] = tags
     try:
         async with session.post(
-            _target(cfg), json=payload, timeout=aiohttp.ClientTimeout(total=8)
+            _base(cfg), json=payload, timeout=aiohttp.ClientTimeout(total=8)
         ) as resp:
             if resp.status != 200:
                 log().warning("ntfy push failed: http %s", resp.status)
