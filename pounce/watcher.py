@@ -8,6 +8,7 @@ import aiohttp
 
 from .auth import get_mc_token
 from .common import (
+    DROP_DELAY_S,
     cyan,
     fmt_ts,
     green,
@@ -26,6 +27,7 @@ from .store import (
     list_targets,
     mark_batch,
     pending_hunts,
+    set_droptime,
     set_state,
     upcoming_timed,
 )
@@ -54,6 +56,14 @@ class Watcher:
 
     def paused(self):
         return kv_get("auto_claim_paused") == "1"
+
+    def schedule_next_drop(self, name, ts=None):
+        """a name got taken or we lost the race: the winner holds it until
+        exactly now + drop delay. remember the moment so hunt/timed can
+        snipe the next cycle instead of hoping the sweep catches it."""
+        ts = ts or time.time()
+        set_droptime(name, ts + DROP_DELAY_S)
+        event("NEXT_DROP", name, f"retake frees at ~{fmt_ts(ts + DROP_DELAY_S)}")
 
     def may_claim(self, target):
         if self.paused() or not self.cfg.get("auto_claim"):
@@ -93,6 +103,7 @@ class Watcher:
         event("CLAIM_FAIL", name, f"{status} {body}")
         log().warning("claim of %s failed: http %s %s", name, status, body)
         if status not in (-1, 429, 500, 501, 502, 503, 504):
+            self.schedule_next_drop(name)
             fire(self.session, self.cfg, f"lost {name}",
                  f"claim rejected: http {status}", tags=["cry"])
         return False
@@ -139,9 +150,11 @@ class Watcher:
                     return
             else:
                 event("TAKEN_AGAIN", name, "someone grabbed it while we retried")
+                self.schedule_next_drop(name)
                 log().info("%s got taken while we retried, moving on", yellow(name))
                 return
         set_state(name, "missed")
+        self.schedule_next_drop(name)
 
     def handle_batch(self, targets, present, ts):
         """one sweep slice. flags list of (target) that just dropped."""
@@ -159,6 +172,7 @@ class Watcher:
                 dropped.append(t)
             elif not was_present and is_present:
                 event("TAKEN", name)
+                self.schedule_next_drop(name, ts)
                 log().info("%s got taken", yellow(name))
             mark_batch(name, is_present, t.get("owner_uuid") if is_present else "", ts)
         return dropped
