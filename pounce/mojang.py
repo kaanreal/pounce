@@ -40,6 +40,23 @@ def _headers(token=None):
     return h
 
 
+async def name_history(session, uuid, limiter=None):
+    """public name history for a uuid: list of {name, changedToAt?} oldest
+    first. changedToAt on a non-first entry is the exact instant the owner
+    renamed into it, which is also the instant the previous name freed."""
+    if limiter:
+        await limiter.acquire()
+    try:
+        async with session.get(
+            f"{API_MOJANG}/user/profile/{uuid}/names", headers=_headers()
+        ) as r:
+            if r.status != 200:
+                return None
+            return await r.json()
+    except aiohttp.ClientError:
+        return None
+
+
 async def check_name(session, name, limiter=None):
     """availability via public lookup. returns dict:
     status: taken | free | ratelimited | error"""

@@ -17,10 +17,11 @@ from .common import (
     yellow,
 )
 from .hunter import hunt
-from .mojang import RateLimiter, batch_lookup, check_name, claim_name
+from .mojang import RateLimiter, batch_lookup, claim_name, name_history
 from .notify import fire
 from .store import (
     event,
+    get_target,
     kv_get,
     kv_set,
     due_targets,
@@ -57,13 +58,23 @@ class Watcher:
     def paused(self):
         return kv_get("auto_claim_paused") == "1"
 
-    def schedule_next_drop(self, name, ts=None):
-        """a name got taken or we lost the race: the winner holds it until
-        exactly now + drop delay. remember the moment so hunt/timed can
-        snipe the next cycle instead of hoping the sweep catches it."""
+    async def schedule_next_drop(self, name, ts=None):
+        """a name just went free: mojang locks it for DROP_DELAY_S after the
+        old owner renames away. detection is up to one sweep pass late, so
+        when the target's stored uuid is the real old owner, ask their name
+        history for the exact abandon instant instead of guessing."""
         ts = ts or time.time()
-        set_droptime(name, ts + DROP_DELAY_S)
-        event("NEXT_DROP", name, f"retake frees at ~{fmt_ts(ts + DROP_DELAY_S)}")
+        droptime = ts + DROP_DELAY_S
+        t = get_target(name)
+        uuid = t.get("owner_uuid") if t else None
+        if uuid:
+            hist = await name_history(self.session, uuid, self.limiter)
+            if hist and name.lower() in {h.get("name", "").lower() for h in hist}:
+                abandoned = (hist[-1].get("changedToAt") or 0) / 1000
+                if abandoned > 0:
+                    droptime = abandoned + DROP_DELAY_S
+        set_droptime(name, droptime)
+        event("NEXT_DROP", name, f"claimable ~{fmt_ts(droptime)}")
 
     def may_claim(self, target):
         if self.paused() or not self.cfg.get("auto_claim"):
@@ -102,59 +113,47 @@ class Watcher:
             return True
         event("CLAIM_FAIL", name, f"{status} {body}")
         log().warning("claim of %s failed: http %s %s", name, status, body)
-        if status not in (-1, 429, 500, 501, 502, 503, 504):
-            self.schedule_next_drop(name)
-            fire(self.session, self.cfg, f"lost {name}",
-                 f"claim rejected: http {status}", tags=["cry"])
+        await self.schedule_next_drop(name)
+        fire(self.session, self.cfg, f"can't take {name} yet",
+             f"in mojang's hold, rematch booked", tags=["calendar"])
         return False
 
     async def _flip_flow(self, target):
-        """a watched name just went free. claim it, and if the first try
-        hits a transient error keep re-firing while it stays free.
-        burst now, then a retry ladder, then give up."""
+        """a watched name just went free. names that free via a rename-away
+        sit in mojang's 37 day hold and are NOT claimable yet, so this is
+        really about booking the day their hold ends. one probe grabs the
+        rare account-deletion flip; everything else goes on the calendar."""
         name = target["name"]
         if not self.may_claim(target):
             return
 
-        async def one_shot():
+        try:
             tok = await self.token()
             status, body = await claim_name(self.session, tok, name)
-            if status == 200:
-                set_state(name, "claimed")
-                event("CLAIM_SUCCESS", name, "drop burst")
-                log().info(green(f">>> {name} IS YOURS <<<"))
-                fire(self.session, self.cfg, f"{name} is yours!",
-                     "drop burst won", tags=["tada", "partying_face"])
-                if self.cfg.get("pause_after_claim"):
-                    kv_set("auto_claim_paused", "1")
-                    log().warning("auto claiming paused after the win"
-                                  " (`resume` to re-enable)")
-            else:
-                event("CLAIM_FAIL", name, f"{status} {body}")
-                log().warning("claim of %s failed: http %s %s", name, status, body)
-                if status not in (-1, 429, 500, 501, 502, 503, 504):
-                    fire(self.session, self.cfg, f"lost {name}",
-                         f"claim rejected: http {status}", tags=["cry"])
-            return status
-
-        if await one_shot() == 200:
+        except Exception as e:
+            await self.schedule_next_drop(name)
+            event("CLAIM_FAIL", name, f"probe crashed, booked rematch: {e}")
+            log().error("%s freed but probe failed (%s), rematch booked", name, e)
             return
-        # transient failures (429 / 5xx / net): keep trying while it stays free
-        for delay in self.cfg.get("flip_retry_delays", [10, 30, 90, 300]):
-            await asyncio.sleep(delay)
-            if self.paused():
-                break
-            res = await check_name(self.session, name, self.limiter)
-            if res["status"] == "free":
-                if await one_shot() == 200:
-                    return
-            else:
-                event("TAKEN_AGAIN", name, "someone grabbed it while we retried")
-                self.schedule_next_drop(name)
-                log().info("%s got taken while we retried, moving on", yellow(name))
-                return
-        set_state(name, "missed")
-        self.schedule_next_drop(name)
+        if status == 200:
+            set_state(name, "claimed")
+            event("CLAIM_SUCCESS", name, "drop burst")
+            log().info(green(f">>> {name} IS YOURS <<<"))
+            fire(self.session, self.cfg, f"{name} is yours!", "drop burst won",
+                 tags=["tada", "partying_face"])
+            if self.cfg.get("pause_after_claim"):
+                kv_set("auto_claim_paused", "1")
+                log().warning("auto claiming paused after the win"
+                              " (`resume` to re-enable)")
+            return
+        await self.schedule_next_drop(name)
+        event("CLAIM_FAIL", name, f"{status} {body}")
+        fire(self.session, self.cfg, f"{name} is in mojang's hold",
+             f"freed but not claimable yet, rematch on the calendar",
+             tags=["calendar"])
+        log().warning(
+            "%s freed but is in mojang's hold (http %s), rematch booked %s",
+            yellow(name), status, fmt_ts(time.time() + DROP_DELAY_S))
 
     def handle_batch(self, targets, present, ts):
         """one sweep slice. flags list of (target) that just dropped."""
@@ -168,11 +167,11 @@ class Watcher:
                 event("FLIP_FREE", name, f"freeing since ~{fmt_ts(lo)}")
                 log().info("%s just went FREE (since %s)!", cyan(name), fmt_ts(lo))
                 fire(self.session, self.cfg, f"{name} went free!",
-                     f"dropped since ~{fmt_ts(lo)}, pounce is on it", tags=["tada"])
+                     f"in mojang's hold 37 days, rematch on the calendar",
+                     tags=["calendar"])
                 dropped.append(t)
             elif not was_present and is_present:
                 event("TAKEN", name)
-                self.schedule_next_drop(name, ts)
                 log().info("%s got taken", yellow(name))
             mark_batch(name, is_present, t.get("owner_uuid") if is_present else "", ts)
         return dropped

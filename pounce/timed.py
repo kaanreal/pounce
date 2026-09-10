@@ -6,7 +6,7 @@ import time
 from email.utils import parsedate_to_datetime
 
 from .common import MCSERVICES, fmt_duration, green, log, red
-from .mojang import claim_name
+from .mojang import check_name, claim_name
 from .store import event, kv_set, set_state
 
 
@@ -96,11 +96,14 @@ async def snipe(session, cfg, name, droptime, token_getter, dry_run=False):
             if status == 200:
                 result = "won"
                 break
-            if status == 403:
-                result = "lost"
-                break  # name gone to someone else (or our lock); more attempts pointless
+            # 403 here just means still inside mojang's hold window if our
+            # droptime anchor was a bit early. keep the burst going, the
+            # press phase after handles a still-locked name.
             # 429 / 5xx / network: back off slightly and keep trying
         await asyncio.sleep(spacing)
+
+    if result is None:
+        result = await _press_until_lift(session, cfg, name, token)
 
     if dry_run:
         log().info("[dry-run] done")
@@ -120,3 +123,26 @@ async def snipe(session, cfg, name, droptime, token_getter, dry_run=False):
     log().warning("%s: no luck (%s)", name, result)
     set_state(name, "missed")
     return result
+
+
+async def _press_until_lift(session, cfg, name, token):
+    """burst over but no win: the name is probably still inside mojang's
+    hold because our droptime anchor was a little early. keep pressing on a
+    widening ladder while the availability api still lists it as free.
+    the instant the hold lifts one of these lands."""
+    for delay in cfg.get("flip_retry_delays", [2, 10, 30, 120, 300, 900, 1800, 3600]):
+        await asyncio.sleep(delay)
+        try:
+            res = await check_name(session, name)
+        except Exception as e:
+            log().warning("%s press check failed: %s", name, e)
+            continue
+        if res["status"] != "free":
+            return "lost"  # someone took it while we waited
+        status, body = await claim_name(session, token, name)
+        verdict = classify_claim(status, body)
+        log().info("press at +%ds -> %s", delay, green(verdict) if status == 200 else red(verdict))
+        event("CLAIM_ATTEMPT", name, f"{status} {verdict}")
+        if status == 200:
+            return "won"
+    return "gave up early / saw nothing land"

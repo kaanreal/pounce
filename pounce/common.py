@@ -38,8 +38,10 @@ DEFAULT_CONFIG = {
     "limiter_window_s": 600,
     # batch sweep: names checked per request (max 10), full fleet pass ~45 min
     "batch_slice": 10,
-    # after a drop, keep re-firing at these intervals while the name stays free
-    "flip_retry_delays": [10, 30, 90, 300],
+    # after the burst near the booked drop, keep pressing while the name
+    # still lists as free. sparse ladder, zero rate cost, catches a wrong
+    # droptime estimate for hours.
+    "flip_retry_delays": [2, 10, 30, 120, 300, 900, 1800, 3600, 7200, 14400, 28800],
     # flip hunting (polling a name around its drop window)
     "hunt_pre_margin_s": 120,
     "hunt_post_margin_s": 600,
